@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+*.log
+opentofu/.terraform/
+opentofu/.plan.out
+opentofu/plan.out
+opentofu/terraform.tfvars
+*.hcl
+*.tfstate
+*.backup
+Minikube/
+bookinfo.yml
+ansible/inventory.yml

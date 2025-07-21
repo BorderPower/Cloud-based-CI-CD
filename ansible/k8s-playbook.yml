@@ -1,0 +1,336 @@
+---
+- name: Setup Kubernetes Cluster
+  hosts: all
+  become: yes
+  vars:
+    app_name: "k8s"
+    namespace: "default"
+    k8s_version: "1.28.0"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+    
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - wget
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - conntrack
+          - software-properties-common
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Disable swap
+      shell: swapoff -a
+      changed_when: false
+
+    - name: Remove swap from fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Set kernel modules to load on boot
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+        mode: '0644'
+
+    - name: Set sysctl parameters for Kubernetes
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Create containerd configuration directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate containerd configuration
+      shell: containerd config default
+      register: containerd_config
+      changed_when: false
+
+    - name: Write containerd configuration
+      copy:
+        content: "{{ containerd_config.stdout }}"
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+      notify: restart containerd
+
+    - name: Configure containerd to use systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: restart containerd
+
+    - name: Start and enable containerd service
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Add Kubernetes APT repository key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key
+        dest: /tmp/kubernetes-release.key
+        mode: '0644'
+
+    - name: Add Kubernetes APT repository key to keyring
+      shell: |
+        cat /tmp/kubernetes-release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Create apt keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Update apt cache after adding Kubernetes repo
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet={{ k8s_version }}-1.1
+          - kubeadm={{ k8s_version }}-1.1
+          - kubectl={{ k8s_version }}-1.1
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable and start kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Update /etc/hosts with cluster nodes
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item]['ansible_default_ipv4']['address'] }} {{ item }}"
+        state: present
+      loop: "{{ groups['all'] }}"
+
+  handlers:
+    - name: restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+- name: Initialize Kubernetes Master
+  hosts: masters
+  become: yes
+  vars:
+    k8s_version: "1.28.0"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+    
+  tasks:
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: Initialize Kubernetes cluster
+      shell: |
+        kubeadm init \
+          --apiserver-advertise-address={{ ansible_default_ipv4.address }} \
+          --pod-network-cidr={{ pod_network_cidr }} \
+          --service-cidr={{ service_cidr }} \
+          --kubernetes-version=v{{ k8s_version }} \
+          --cri-socket=unix:///var/run/containerd/containerd.sock
+      register: kubeadm_init_result
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Create .kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to root's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        mode: '0644'
+        remote_src: yes
+
+    - name: Create .kube directory for ansible user
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy admin.conf to ansible user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+        remote_src: yes
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command_result
+      changed_when: false
+
+    - name: Set join command fact
+      set_fact:
+        join_command: "{{ join_command_result.stdout }}"
+
+    - name: Install Flannel CNI
+      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      become_user: "{{ ansible_user }}"
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Wait for CoreDNS pods to be ready
+      shell: kubectl get pods -n kube-system -l k8s-app=kube-dns -o jsonpath='{.items[*].status.phase}'
+      register: coredns_status
+      until: coredns_status.stdout.find("Running") != -1
+      retries: 30
+      delay: 10
+      become_user: "{{ ansible_user }}"
+
+- name: Join Worker Nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Check if node is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join worker nodes to cluster
+      shell: "{{ hostvars[groups['masters'][0]]['join_command'] }}"
+      when: not kubelet_conf.stat.exists
+
+    - name: Wait for node to be ready
+      shell: kubectl get nodes {{ inventory_hostname }} --no-headers | awk '{print $2}'
+      register: node_status
+      until: node_status.stdout == "Ready"
+      retries: 30
+      delay: 10
+      delegate_to: "{{ groups['masters'][0] }}"
+      become_user: "{{ ansible_user }}"
+
+- name: Verify Cluster Setup
+  hosts: masters
+  become: yes
+  tasks:
+    - name: Get cluster info
+      shell: kubectl cluster-info
+      register: cluster_info
+      become_user: "{{ ansible_user }}"
+
+    - name: Display cluster info
+      debug:
+        msg: "{{ cluster_info.stdout_lines }}"
+
+    - name: Get all nodes
+      shell: kubectl get nodes -o wide
+      register: all_nodes
+      become_user: "{{ ansible_user }}"
+
+    - name: Display all nodes
+      debug:
+        msg: "{{ all_nodes.stdout_lines }}"
+
+    - name: Get all pods in all namespaces
+      shell: kubectl get pods --all-namespaces
+      register: all_pods
+      become_user: "{{ ansible_user }}"
+
+    - name: Display all pods
+      debug:
+        msg: "{{ all_pods.stdout_lines }}"
+
+    - name: Create a test deployment
+      shell: |
+        kubectl create deployment nginx-test --image=nginx --replicas=2
+        kubectl expose deployment nginx-test --type=NodePort --port=80
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+
+    - name: Wait for test deployment to be ready
+      shell: kubectl get deployment nginx-test -o jsonpath='{.status.readyReplicas}'
+      register: deployment_ready
+      until: deployment_ready.stdout == "2"
+      retries: 30
+      delay: 10
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+
+    - name: Get test service details
+      shell: kubectl get service nginx-test
+      register: test_service
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+
+    - name: Display test service
+      debug:
+        msg: "{{ test_service.stdout_lines }}"
+      when: test_service.stdout is defined

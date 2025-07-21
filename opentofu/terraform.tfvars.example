@@ -1,0 +1,6 @@
+project_id           = "your-project-id"
+
+vm_names = ["your-vm-name-1", "your-vm-name-2"]
+
+ssh_user        = "your-username"
+ssh_public_key  = "ssh public key or ssh public key path"
